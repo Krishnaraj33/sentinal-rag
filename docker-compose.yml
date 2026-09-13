@@ -1,0 +1,156 @@
+services:
+  # 1. PostgreSQL 16 - Relational Metadata & Content Hashes (Accessible on LAN)
+  postgres:
+    image: postgres:16-alpine
+    container_name: sentinel_postgres
+    restart: unless-stopped
+    command: postgres -c listen_addresses='*' -c max_connections=100
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sentinel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sentinel_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-sentinel_db}
+    ports:
+      - "0.0.0.0:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. Redis 7 - Event Broker & Task Queue (Accessible on LAN without protected-mode lock)
+  redis:
+    image: redis:7.2-alpine
+    container_name: sentinel_redis
+    restart: unless-stopped
+    command: redis-server --protected-mode no --bind 0.0.0.0
+    ports:
+      - "0.0.0.0:6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # 3. Qdrant - Payload-Indexed Vector Database (Accessible on LAN)
+  qdrant:
+    image: qdrant/qdrant:v1.12.1
+    container_name: sentinel_qdrant
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:6333:6333"
+      - "0.0.0.0:6334:6334"
+    volumes:
+      - qdrantdata:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/6333'"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # 4. FastAPI Gateway / Retrieval Engine (Accessible on LAN)
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: sentinel_api
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+    ports:
+      - "0.0.0.0:8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-sentinel}:${POSTGRES_PASSWORD:-sentinel_secret}@postgres:5432/${POSTGRES_DB:-sentinel_db}
+      - DATABASE_SYNC_URL=postgresql+psycopg2://${POSTGRES_USER:-sentinel}:${POSTGRES_PASSWORD:-sentinel_secret}@postgres:5432/${POSTGRES_DB:-sentinel_db}
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-sentinel_knowledge_base}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-enterprise_super_secret_jwt_key_2026_change_in_prod}
+      - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-enterprise_webhook_secret_2026}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai_compatible}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://openrouter.ai/api/v1}
+      - LLM_MODEL=${LLM_MODEL:-nvidia/nemotron-3.5-lightning:free}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-4096}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-sentence_transformers}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - RERANKER_MODEL=${RERANKER_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
+      - RERANKER_ENABLED=${RERANKER_ENABLED:-true}
+      - HF_HOME=/app/models
+    volumes:
+      - ./models:/app/models
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8000/api/v1/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+
+  # 5. Async Ingestion Worker (Celery)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: sentinel_worker
+    restart: unless-stopped
+    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=2
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-sentinel}:${POSTGRES_PASSWORD:-sentinel_secret}@postgres:5432/${POSTGRES_DB:-sentinel_db}
+      - DATABASE_SYNC_URL=postgresql+psycopg2://${POSTGRES_USER:-sentinel}:${POSTGRES_PASSWORD:-sentinel_secret}@postgres:5432/${POSTGRES_DB:-sentinel_db}
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-sentinel_knowledge_base}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-enterprise_webhook_secret_2026}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai_compatible}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-sentence_transformers}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - HF_HOME=/app/models
+    volumes:
+      - ./models:/app/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+
+  # 6. Interactive Showcase UI (Streamlit - Accessible on LAN with CORS/XSRF unblocked)
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    container_name: sentinel_ui
+    restart: unless-stopped
+    command: streamlit run ui/app.py --server.port=8501 --server.address=0.0.0.0 --server.enableCORS=false --server.enableXsrfProtection=false
+    ports:
+      - "0.0.0.0:8501:8501"
+    environment:
+      - API_GATEWAY_URL=http://api:8000
+      - PYTHONPATH=/app
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-enterprise_super_secret_jwt_key_2026_change_in_prod}
+      - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  qdrantdata:
